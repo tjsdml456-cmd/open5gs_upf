@@ -124,6 +124,13 @@ typedef struct upf_sess_s {
     /* Accounting: */
     upf_sess_urr_acc_t urr_acc[OGS_MAX_NUM_OF_URR]; /* FIXME: This probably needs to be mved to a hashtable or alike */
     char            *apn_dnn;            /* APN/DNN Item */
+
+    /* First packet with new QFI after QoS modification (reset when N4 QER update applied) */
+    bool            first_qfi_packet_logged;
+
+    /* Last DSCP logged at UPF ingress (log again only when DSCP changes) */
+    uint8_t         last_ingress_dscp;
+    bool            last_ingress_dscp_valid;
 } upf_sess_t;
 
 void upf_context_init(void);
@@ -162,3 +169,4 @@ void upf_sess_urr_acc_timers_setup(upf_sess_t *sess, ogs_pfcp_urr_t *urr);
 #endif
 
 #endif /* UPF_CONTEXT_H */
+

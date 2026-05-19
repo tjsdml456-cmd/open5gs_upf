@@ -47,6 +47,9 @@
 #include <ifaddrs.h>
 #endif
 
+#include <sys/time.h>
+#include <time.h>
+
 #include "arp-nd.h"
 #include "event.h"
 #include "gtp-path.h"
@@ -58,6 +61,77 @@
 const uint8_t proxy_mac_addr[] = { 0x0e, 0x00, 0x00, 0x00, 0x00, 0x01 };
 
 static ogs_pkbuf_pool_t *packet_pool = NULL;
+
+/*
+ * Log when DSCP is first seen at UPF (or changes).  IPv4 TOS / IPv6 traffic class.
+ * wall=REALTIME for correlation with iperf3_dscp_100cycles_dl.sh [HH:MM:SS].
+ */
+static bool upf_pkbuf_get_dscp(const ogs_pkbuf_t *pkbuf, uint8_t *dscp_out, uint8_t *tos_out)
+{
+    const struct ip *ip_h = NULL;
+
+    ogs_assert(dscp_out);
+    ogs_assert(tos_out);
+
+    if (!pkbuf || pkbuf->len < 1)
+        return false;
+
+    ip_h = (const struct ip *)pkbuf->data;
+    if (ip_h->ip_v == 4) {
+        if (pkbuf->len < sizeof(struct ip))
+            return false;
+        *tos_out = ip_h->ip_tos;
+        *dscp_out = (ip_h->ip_tos >> 2) & 0x3f;
+        return true;
+    }
+    if (ip_h->ip_v == 6) {
+        const struct ip6_hdr *ip6_h = (const struct ip6_hdr *)pkbuf->data;
+        uint32_t flow;
+        if (pkbuf->len < sizeof(struct ip6_hdr))
+            return false;
+        flow = ntohl(ip6_h->ip6_flow);
+        *dscp_out = (flow >> 20) & 0x3f;
+        *tos_out = (uint8_t)((flow >> 16) & 0xff);
+        return true;
+    }
+    return false;
+}
+
+static void upf_log_dscp_ingress(upf_sess_t *sess, ogs_pkbuf_t *pkbuf, const char *path)
+{
+    uint8_t dscp = 0, tos = 0;
+    struct timeval wall;
+
+    ogs_assert(sess);
+    ogs_assert(path);
+
+    if (!upf_pkbuf_get_dscp(pkbuf, &dscp, &tos))
+        return;
+
+    if (sess->last_ingress_dscp_valid && sess->last_ingress_dscp == dscp)
+        return;
+
+    {
+        struct tm tm_local;
+        time_t sec = 0;
+
+        gettimeofday(&wall, NULL);
+        sec = wall.tv_sec;
+        localtime_r(&sec, &tm_local);
+        ogs_info("[UPF-DSCP] [%s] DSCP=%u TOS=0x%02x wall=%02d:%02d:%02d.%06ld APN=%s",
+                path,
+                dscp,
+                tos,
+                tm_local.tm_hour,
+                tm_local.tm_min,
+                tm_local.tm_sec,
+                (long)wall.tv_usec,
+                sess->apn_dnn ? sess->apn_dnn : "-");
+    }
+
+    sess->last_ingress_dscp = dscp;
+    sess->last_ingress_dscp_valid = true;
+}
 
 static void upf_gtp_handle_multicast(ogs_pkbuf_t *recvbuf);
 
@@ -151,7 +225,7 @@ static void _gtpv1_tun_recv_common_cb(
         if (replybuf) {
             if (ogs_tun_write(fd, replybuf) != OGS_OK)
                 ogs_warn("ogs_tun_write() for reply failed");
-
+            
             ogs_pkbuf_free(replybuf);
             goto cleanup;
         }
@@ -166,6 +240,9 @@ static void _gtpv1_tun_recv_common_cb(
     sess = upf_sess_find_by_ue_ip_address(recvbuf);
     if (!sess)
         goto cleanup;
+
+    /* DL from N6/TUN: first time this DSCP is seen on the session */
+    upf_log_dscp_ingress(sess, recvbuf, "N6-TUN-DL");
 
     ogs_list_for_each(&sess->pfcp.pdr_list, pdr) {
         far = pdr->far;
@@ -513,6 +590,16 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
         sess = UPF_SESS(pdr->sess);
         ogs_assert(sess);
 
+        /* UL from N3/GTP-U: DSCP in inner IP before forward to N6 */
+        upf_log_dscp_ingress(sess, pkbuf, "N3-GTP-UL");
+
+        /* First packet with this QFI after last QoS modification (UL from RAN) */
+        if (pdr->qer && pdr->qer->qfi && !sess->first_qfi_packet_logged) {
+            ogs_info("[QoS-MODIFY] [FIRST-PACKET-UL] First packet with QFI=%d after QoS change (TEID=0x%x)",
+                    pdr->qer->qfi, header_desc.teid);
+            sess->first_qfi_packet_logged = true;
+        }
+
         far = pdr->far;
         ogs_assert(far);
 
@@ -703,12 +790,6 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
             far->dst_if_type_presence == true &&
             far->dst_if_type == OGS_PFCP_3GPP_INTERFACE_TYPE_N6) {
 
-            upf_sess_t *dst_sess = NULL;
-            ogs_pfcp_pdr_t *dl_pdr = NULL;
-            ogs_pfcp_pdr_t *dl_fallback_pdr = NULL;
-            ogs_pfcp_far_t *dl_far = NULL;
-            ogs_pfcp_user_plane_report_t dl_report;
-
             if (!subnet) {
 #if 0 /* It's redundant log message */
                 ogs_error("[DROP] Cannot find subnet V:%d, IPv4:%p, IPv6:%p",
@@ -725,103 +806,6 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
             for (i = 0; i < pdr->num_of_urr; i++)
                 upf_sess_urr_acc_add(sess, pdr->urr[i], pkbuf->len, true);
 
-            /*
-             * If destined to another UE on the same subnet,
-             * hairpin back out.
-             *
-             * subnet is already resolved from the source UE
-             * (sess->ipv4->subnet or sess->ipv6->subnet).
-             * A cheap subnet check gates the session lookup so that
-             * normal internet traffic does not touch the hash table.
-             */
-            if (ip_h->ip_v == 4 && subnet->family == AF_INET) {
-                if (ogs_unlikely(
-                        (ip_h->ip_dst.s_addr & subnet->sub.mask[0]) ==
-                        subnet->sub.sub[0]))
-                    dst_sess = upf_sess_find_by_ipv4(ip_h->ip_dst.s_addr);
-            } else if (ip_h->ip_v == 6 && subnet->family == AF_INET6) {
-                struct ip6_hdr *ip6_h = (struct ip6_hdr *)ip_h;
-                uint32_t *dst6 = (void *)ip6_h->ip6_dst.s6_addr;
-
-                if (ogs_unlikely(
-                    (dst6[0] & subnet->sub.mask[0]) == subnet->sub.sub[0] &&
-                    (dst6[1] & subnet->sub.mask[1]) == subnet->sub.sub[1] &&
-                    (dst6[2] & subnet->sub.mask[2]) == subnet->sub.sub[2] &&
-                    (dst6[3] & subnet->sub.mask[3]) == subnet->sub.sub[3]))
-                    dst_sess = upf_sess_find_by_ipv6(dst6);
-            }
-
-            if (ogs_unlikely(dst_sess != NULL) && dst_sess != sess) {
-                memset(&dl_report, 0, sizeof(dl_report));
-
-                ogs_list_for_each(&dst_sess->pfcp.pdr_list, dl_pdr) {
-                    dl_far = dl_pdr->far;
-                    ogs_assert(dl_far);
-
-                    /* Check if PDR is Downlink */
-                    if (dl_pdr->src_if != OGS_PFCP_INTERFACE_CORE)
-                        continue;
-
-                    /* Save the Fallback PDR : Lowest presedence downlink PDR */
-                    dl_fallback_pdr = dl_pdr;
-
-                    /* Check if FAR is Downlink */
-                    if (dl_far->dst_if != OGS_PFCP_INTERFACE_ACCESS)
-                        continue;
-
-                    /* Check if Outer header creation */
-                    if (dl_far->outer_header_creation.gtpu4 == 0 &&
-                        dl_far->outer_header_creation.gtpu6 == 0)
-                        continue;
-
-                    /* Check if Rule List in PDR */
-                    if (ogs_list_first(&dl_pdr->rule_list) &&
-                        ogs_pfcp_pdr_rule_find_by_packet(
-                            dl_pdr, pkbuf) == NULL)
-                        continue;
-
-                    break;
-                }
-
-                if (!dl_pdr)
-                    dl_pdr = dl_fallback_pdr;
-
-                if (dl_pdr) {
-                    /* Increment dl octets + pkts */
-                    for (i = 0; i < dl_pdr->num_of_urr; i++)
-                        upf_sess_urr_acc_add(
-                            dst_sess, dl_pdr->urr[i],
-                            pkbuf->len, false);
-
-                    ogs_assert(true == ogs_pfcp_up_handle_pdr(
-                        dl_pdr, OGS_GTPU_MSGTYPE_GPDU,
-                        0, NULL, pkbuf, &dl_report));
-
-                    if (dl_report.type.downlink_data_report) {
-                        upf_sess_t *dl_sess = NULL;
-
-                        ogs_assert(dl_pdr->sess);
-                        dl_sess = UPF_SESS(dl_pdr->sess);
-                        ogs_assert(dl_sess);
-
-                        dl_report.downlink_data.pdr_id = dl_pdr->id;
-                        if (dl_pdr->qer && dl_pdr->qer->qfi)
-                            dl_report.downlink_data.qfi =
-                                dl_pdr->qer->qfi; /* for 5GC */
-
-                        ogs_assert(OGS_OK ==
-                            upf_pfcp_send_session_report_request(dl_sess, &dl_report));
-                    }
-
-                    /*
-                    * The ogs_pfcp_up_handle_pdr() function
-                    * buffers or frees the Packet Buffer(pkbuf) memory.
-                    */
-                    return;
-                }
-                /* No matching downlink PDR - fall through to TUN */
-            }
-
             if (dev->is_tap) {
                 ogs_assert(eth_type);
                 eth_type = htobe16(eth_type);
@@ -833,6 +817,7 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
                 memcpy(pkbuf->data, dev->mac_addr, ETHER_ADDR_LEN);
             }
 
+            /* TODO: if destined to another UE, hairpin back out. */
             if (ogs_tun_write(dev->fd, pkbuf) != OGS_OK)
                 ogs_warn("ogs_tun_write() failed");
 
@@ -1081,3 +1066,4 @@ static void upf_gtp_handle_multicast(ogs_pkbuf_t *recvbuf)
         }
     }
 }
+
